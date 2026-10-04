@@ -1,0 +1,12 @@
+{
+  "name": "ruby-auto-emotion-helper",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Independent experimental RUBY companion for gradual emotions; not an official RUBY release.",
+  "scripts": {
+    "test": "node --test tests.mjs",
+    "check": "node --check index.js && node --check host.mjs && node --check core.mjs"
+  },
+  "engines": { "node": ">=22" }
+}

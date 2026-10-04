@@ -1,0 +1,14 @@
+# Only independent source belongs in this repository.
+node_modules/
+.env
+.env.*
+*.log
+*.zip
+*.png
+*.jpg
+*.jsonl
+*备份*.json
+*backup*.json
+local-data/
+private/
+dist/
