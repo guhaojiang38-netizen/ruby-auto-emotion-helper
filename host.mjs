@@ -1,16 +1,22 @@
 import { clone, hasTasks, makeSources, selectionMessages, validateSelection,
-  makeDraft, materialize, toggleOwned, transactionalWrite, extractGameBody } from './core.mjs';
+  makeDraft, materialize, toggleOwned, transactionalWrite, assertGameReady, localSelection, refreshOwnedRules } from './core.mjs';
 
 // Only the already-installed, same-origin RUBY 1.8.0 is imported. No remote loader.
 export function rubyCandidates(doc, origin, explicitFolder = '') {
+  let base;
+  try { base = new URL(doc.baseURI || origin); } catch { throw new Error('酒馆主文档URL基准无效，未导入任何模块。'); }
+  if (!['http:', 'https:'].includes(base.protocol)) throw new Error('酒馆主文档URL基准无效，未导入任何模块。');
+  const hostOrigin = base.origin;
+  if (origin && origin !== 'null' && new URL(origin).origin !== hostOrigin) throw new Error('文档URL与酒馆来源不一致，未导入任何模块。');
   const names = new Set();
   if (explicitFolder) {
     if (!/^[\w.-]+$/.test(explicitFolder) || explicitFolder === '.' || explicitFolder === '..') throw new Error('RUBY目录名不合格。');
     names.add(explicitFolder);
   } else for (const script of doc.querySelectorAll('script[src]')) {
-    const url = new URL(script.src, origin);
+    let url;
+    try { url = new URL(script.src, base); } catch { continue; }
     const match = url.pathname.match(/^\/scripts\/extensions\/third-party\/([\w.-]+)\/index\.js$/);
-    if (url.origin === origin && match) names.add(match[1]);
+    if (url.origin === hostOrigin && match) names.add(match[1]);
   }
   return [...names];
 }
@@ -18,7 +24,7 @@ export function rubyCandidates(doc, origin, explicitFolder = '') {
 export function context() {
   const c = globalThis.SillyTavern?.getContext?.();
   const required = ['getRequestHeaders', 'saveWorldInfo', 'writeExtensionFieldBulk', 'getExtensionManifest', 'getCurrentChatId'];
-  if (!c || required.some(k => typeof c[k] !== 'function') || c.constants?.unset === undefined) throw new Error('酒馆缺少测试版需要的API；目标版本是1.18.0，请先核对版本。');
+  if (!c || required.some(k => typeof c[k] !== 'function') || c.constants?.unset === undefined) throw new Error('酒馆缺少测试版需要的API；已核对1.18.0源码和1.19.0本机，请先核对版本。');
   return c;
 }
 
@@ -50,7 +56,7 @@ export async function connect(folder = '') {
   const { name, manifest } = found[0];
   if (manifest.version !== '1.8.0') throw new Error('当前适配只核对过RUBY 1.8.0，其他版本先不要写入。');
   if (c.extensionSettings?.disabledExtensions?.some(n => n === name || n === `third-party/${name}`)) throw new Error('RUBY处于停用状态，请先在扩展管理器核对。');
-  const base = new URL(`/scripts/extensions/third-party/${name}/src/`, location.origin);
+  const base = new URL(`/scripts/extensions/third-party/${name}/src/`, document.baseURI);
   const [config, ai, worldbook, engine] = await Promise.all(['config.js', 'ai.js', 'worldbook.js', 'engine.js'].map(p => import(new URL(p, base).href)));
   if (typeof ai.callModel !== 'function' || typeof config.normalizePreset !== 'function' || typeof worldbook.getCharBookName !== 'function' || typeof engine.reinit !== 'function') throw new Error('RUBY模块形状与已核对版本不一致。');
   return { config, ai, worldbook, engine };
@@ -82,7 +88,8 @@ async function snapshot(ruby, id, cancelled) {
   const sources = makeSources(card, book);
   const fingerprint = await sha(JSON.stringify({ avatar: id.avatar, bookName, sources }));
   assertIdentity(id, cancelled);
-  return { id, bookName, book, rawConfig: cardConfig(card), sources, fingerprint };
+  return { id, bookName, book, rawConfig: cardConfig(card), sources, fingerprint,
+    authoredGreeting: typeof context().substituteParams === 'function' ? context().substituteParams(card.data?.first_mes ?? card.first_mes ?? '') : null };
 }
 
 export async function generate(ruby, { game, cancelled, progress }) {
@@ -101,11 +108,27 @@ export async function generate(ruby, { game, cancelled, progress }) {
   const fresh = await snapshot(ruby, id, cancelled);
   if (fresh.fingerprint !== captured.fingerprint || !same(fresh.rawConfig, captured.rawConfig) || !same(fresh.book, captured.book)) throw new Error('生成期间素材或方案有变化，请重新生成。');
   const draft = makeDraft({ ...captured, avatar: id.avatar, name: id.name, originalConfig: captured.rawConfig, selection, game });
+  draft.selectionMethod = 'model';
   // Normalize only the new owned scheme, not any unrelated saved fields.
   const index = draft.config.presets.findIndex(p => p.id === draft.presetId);
   draft.config.presets[index] = ruby.config.normalizePreset(draft.config.presets[index]);
   const state = { draft, id, expectedBook: captured.book, applied: false };
   await storeState(id.avatar, state);
+  return state;
+}
+
+export async function generateLocal(ruby, {game, cancelled}) {
+  const id = identity(), captured = await snapshot(ruby,id,cancelled);
+  const legacy = context().extensionSettings?.RubyAnalyzer?.characterConfigs?.[id.avatar];
+  if (hasTasks(captured.rawConfig) || hasTasks(legacy)) throw new Error('这张卡已有方案，不能覆盖作者任务。');
+  const selection = localSelection(captured.sources);
+  const draft = makeDraft({...captured, avatar:id.avatar, name:id.name, originalConfig:captured.rawConfig, selection, game});
+  draft.selectionMethod = 'local-rule';
+  const index = draft.config.presets.findIndex(p => p.id === draft.presetId);
+  draft.config.presets[index] = ruby.config.normalizePreset(draft.config.presets[index]);
+  assertIdentity(id,cancelled);
+  const state = {draft,id,expectedBook:captured.book,applied:false};
+  await storeState(id.avatar,state);
   return state;
 }
 
@@ -146,8 +169,7 @@ export async function toggle(ruby, state, enabled, cancelled) {
   const now = await snapshot(ruby, state.id, cancelled);
   if (now.fingerprint !== state.draft.fingerprint) throw new Error('原卡素材有变化，请先人工核对；本次不切换。');
   if (enabled && state.draft.game) {
-    const latest = [...(context().chat || [])].reverse().find(m => !m.is_user && !m.is_system);
-    if (latest) extractGameBody(latest.mes);
+    assertGameReady(context().chat, now.authoredGreeting);
   }
   const next = toggleOwned(now.book, now.rawConfig, state.draft, enabled);
   await storeBackup(state.id.avatar, { time: new Date().toISOString(), bookName: now.bookName,
@@ -171,6 +193,22 @@ export async function toggle(ruby, state, enabled, cancelled) {
       }
     }
   }
+}
+
+export async function refreshRules(ruby, state, cancelled) {
+  if (!state?.applied) throw new Error('请先读取已经保存的助手草稿。');
+  assertIdle(ruby);
+  const now = await snapshot(ruby,state.id,cancelled);
+  if (now.fingerprint !== state.draft.fingerprint) throw new Error('原卡素材有变化，不能自动同步。');
+  const next = refreshOwnedRules(now.book,now.rawConfig,state.draft);
+  await storeBackup(state.id.avatar,{time:new Date().toISOString(),bookName:now.bookName,book:now.book,config:now.rawConfig,avatar:state.id.avatar});
+  const io = ports(state,cancelled);
+  // Book-only update: verify the config as a concurrency guard, never write the PNG.
+  await transactionalWrite({...io,expectedBook:now.book,expectedConfig:now.rawConfig,nextBook:next.book,nextConfig:now.rawConfig,
+    writeConfig:async raw => { io.assertContext(); if (!same(await io.readConfig(),raw)) throw new Error('任务配置并发变化，本次不覆盖。'); }});
+  state.draft = next.draft;
+  try { await storeState(state.id.avatar,state); }
+  catch { throw new Error('规则已更新，但本地草稿保存失败；请检查备份，不要重新生成方案。'); }
 }
 
 // Own IndexedDB, not RUBY settings. State and backups are private local data.
